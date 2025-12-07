@@ -1,0 +1,17 @@
+{
+  "home": { "lat": 47.8470, "lon": -121.9720 },
+  "radius_miles": 1,
+  "autoRefreshSeconds": 60,
+  "openWeatherKey": "",
+  "wsdotApiKey": "",
+  "wsdot": {
+    "us2CorridorId": "US2_CORRIDOR_ID_PLACEHOLDER",
+    "sr522CorridorId": "SR522_CORRIDOR_ID_PLACEHOLDER"
+  },
+  "outages": {
+    "snoPUDFeed": "https://outagemap.snopud.com/arcgis/rest/services/.../FeatureServer/0/query?where=1=1&outFields=*&f=geojson",
+    "pseFeed": "https://www.pse.com/outage/api/....json",
+    "xfinityFeed": "https://status.xfinity.com/region/status.json"
+  },
+  "crimeFeed": "https://data.snohomishcountywa.gov/resource/CRIMEDATASET.json"
+}
