@@ -1,0 +1,307 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Foothills Dashboard — Boulder Ridge Rd SE (1mi)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    body {font-family: Arial, sans-serif; margin:0; display:flex; height:100vh;}
+    #map {height:100%; width:62%;}
+    #side {width:38%; padding:12px; box-sizing:border-box; overflow:auto;}
+    .widget {border:1px solid #ddd; padding:10px; margin-bottom:12px; border-radius:6px; background:#fff;}
+    .danger {background:#fff0f0;}
+    .ok {background:#f6fff6;}
+    .header {display:flex; justify-content:space-between; align-items:center;}
+    .small {font-size:0.9em; color:#666;}
+    h2{margin:0 0 6px 0;}
+    button{padding:6px 10px;}
+    ul {margin:6px 0 0 18px;}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="side">
+    <div class="header">
+      <div>
+        <h2>Foothills Dashboard</h2>
+        <div class="small">Center: Boulder Ridge Rd SE (1 mile)</div>
+      </div>
+      <div>
+        <button id="refreshBtn">Refresh</button><br/>
+        <label class="small"><input type="checkbox" id="autoRefresh" checked/> Auto</label>
+      </div>
+    </div>
+
+    <div id="lastUpdated" class="small" style="margin-top:6px">Not updated yet</div>
+
+    <div id="threat" class="widget ok" style="margin-top:10px">
+      <h3>Threat Score: <span id="score">—</span></h3>
+      <div id="threatDetails" class="small">No data yet</div>
+    </div>
+
+    <div id="trafficWidget" class="widget">
+      <h3>Traffic</h3>
+      <div><strong>US‑2 (Everett → Leavenworth)</strong>
+        <div id="us2List" class="small">Loading...</div>
+      </div>
+      <hr/>
+      <div><strong>SR‑522 (Monroe → Woodinville)</strong>
+        <div id="sr522List" class="small">Loading...</div>
+      </div>
+    </div>
+
+    <div id="weatherWidget" class="widget">
+      <h3>Weather (local)</h3>
+      <div id="weather" class="small">Loading...</div>
+    </div>
+
+    <div id="outageWidget" class="widget">
+      <h3>Utility Outages</h3>
+      <div id="outages" class="small">Loading...</div>
+    </div>
+
+    <div id="crimeWidget" class="widget">
+      <h3>Crime Trends</h3>
+      <div id="crimeSummary" class="small">Loading...</div>
+      <ul id="crimeList" class="small"></ul>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+  // Load config (expects config.json in same folder). If not found, falls back to example values.
+  async function loadConfig(){
+    try {
+      const r = await fetch('config.json');
+      if(!r.ok) throw new Error('no config.json');
+      return await r.json();
+    } catch(e) {
+      // fallback to example defaults
+      const r2 = await fetch('config.example.json');
+      return await r2.json();
+    }
+  }
+
+  // Haversine (miles)
+  function haversineMiles(lat1,lon1,lat2,lon2){
+    const R = 3958.8;
+    const toRad = d=>d*Math.PI/180;
+    const dLat = toRad(lat2-lat1), dLon = toRad(lon2-lon1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+    return 2*R*Math.asin(Math.sqrt(a));
+  }
+
+  (async function main(){
+    const cfg = await loadConfig();
+    const HOME = cfg.home || {lat:47.8470, lon:-121.9720};
+    const RADIUS_MILES = cfg.radius_miles || 1;
+    const AUTO_REFRESH_MS = (cfg.autoRefreshSeconds || 60) * 1000;
+    const OPENWEATHER_KEY = cfg.openWeatherKey || '';
+
+    // Map
+    const map = L.map('map').setView([HOME.lat, HOME.lon], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+    L.marker([HOME.lat, HOME.lon]).addTo(map).bindPopup('Home (center)');
+    L.circle([HOME.lat, HOME.lon], {radius:RADIUS_MILES*1609.34, color:'#3377ff', fill:false}).addTo(map);
+
+    const incidentsLayer = L.layerGroup().addTo(map);
+    const outagesLayer = L.layerGroup().addTo(map);
+    const trafficLayer = L.layerGroup().addTo(map);
+
+    // UI refs
+    const lastUpdatedEl = document.getElementById('lastUpdated');
+    const scoreEl = document.getElementById('score');
+    const threatDetailsEl = document.getElementById('threatDetails');
+    const us2ListEl = document.getElementById('us2List');
+    const sr522ListEl = document.getElementById('sr522List');
+    const weatherEl = document.getElementById('weather');
+    const outagesEl = document.getElementById('outages');
+    const crimeSummaryEl = document.getElementById('crimeSummary');
+    const crimeListEl = document.getElementById('crimeList');
+
+    async function fetchWeather(){
+      try {
+        // Prefer NWS (no key) then fallback to OpenWeatherMap if key present
+        const nwsUrl = `https://api.weather.gov/points/${HOME.lat},${HOME.lon}`;
+        const p = await fetch(nwsUrl).then(r=>r.json());
+        const forecastUrl = p.properties && p.properties.forecast;
+        let short = 'NWS: ';
+        if(forecastUrl){
+          const f = await fetch(forecastUrl).then(r=>r.json());
+          if(f && f.properties && f.properties.periods && f.properties.periods[0]){
+            const now = f.properties.periods[0];
+            short += `${now.name} — ${now.shortForecast}, ${now.temperature} ${now.temperatureUnit}`;
+            weatherEl.innerText = short;
+            // severity heuristic: storms/heat/cold increase score
+            const severe = /wind|thunder|storm|snow|blizzard|flood|hurricane/i.test(now.shortForecast) ? 30 : 0;
+            return {severity: severe, raw: now};
+          }
+        }
+        // Fallback OpenWeatherMap if key provided
+        if(OPENWEATHER_KEY){
+          const ow = await fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${HOME.lat}&lon=${HOME.lon}&units=imperial&appid=${OPENWEATHER_KEY}`).then(r=>r.json());
+          weatherEl.innerText = `${ow.weather?.[0]?.main || ''} ${Math.round(ow.main.temp)}°F`;
+          const severe = (ow.weather?.[0]?.id >=200 && ow.weather?.[0]?.id<800) ? 20 : 0;
+          return {severity: severe, raw: ow};
+        }
+        weatherEl.innerText = 'Weather data unavailable';
+        return {severity:0};
+      } catch(e){
+        weatherEl.innerText = 'Weather feed error';
+        return {severity:0};
+      }
+    }
+
+    async function fetchTraffic(){
+      try{
+        // WSDOT endpoints usually require a key or specific corridor IDs.
+        // For now we attempt a public WSDOT travelinfo feed if accessible (best-effort).
+        // If not available due to CORS, the README shows how to add a simple proxy.
+        // Placeholder: show "no incidents" default.
+        us2ListEl.innerText = 'No incidents reported (placeholder)';
+        sr522ListEl.innerText = 'No incidents reported (placeholder)';
+        // Clear previous markers
+        trafficLayer.clearLayers();
+        return {severity: 0};
+      }catch(e){
+        us2ListEl.innerText = 'Traffic feed error';
+        sr522ListEl.innerText = 'Traffic feed error';
+        return {severity:0};
+      }
+    }
+
+    async function fetchOutages(){
+      try{
+        // Try SnoPUD GeoJSON if user filled config with working URL
+        const feeds = cfg.outages || {};
+        const items = [];
+        // SnoPUD
+        if(feeds.snoPUDFeed){
+          try{
+            const r = await fetch(feeds.snoPUDFeed).then(res=>res.json());
+            // Accept GeoJSON FeatureCollection with features having coordinates
+            if(r.features){
+              r.features.slice(0,10).forEach(f=>{
+                const c = f.geometry && f.geometry.coordinates;
+                if(c){
+                  const lon=c[0], lat=c[1];
+                  items.push({lat,lon,desc: f.properties && (f.properties.outage_description || f.properties.Status || 'outage'), customers: f.properties && f.properties.customers});
+                }
+              });
+            }
+          }catch(e){}
+        }
+        // PSE / Xfinity placeholders
+        if(feeds.pseFeed){
+          // Attempt fetch; many vendor feeds block CORS or require keys
+          try{
+            const r = await fetch(feeds.pseFeed).then(res=>res.json());
+            // adapt per feed shape if available
+            // push minimal entries if present
+            if(Array.isArray(r)) r.slice(0,5).forEach(o=>{ if(o.lat && o.lon) items.push({lat:o.lat,lon:o.lon,desc:o.status||'outage'}); });
+          }catch(e){}
+        }
+        if(feeds.xfinityFeed){
+          try{
+            const r = await fetch(feeds.xfinityFeed).then(res=>res.json());
+            // Many xfinity feeds are per-region; adapt as available
+            if(r && r.regionStatus) items.push({lat:HOME.lat, lon:HOME.lon, desc:'Xfinity region status'});
+          }catch(e){}
+        }
+
+        outagesEl.innerHTML = items.length ? items.map(i=>`• ${i.desc || 'Outage'} ${i.customers ? `— ${i.customers} customers` : ''}`).join('<br/>') : 'No public outage entries found (or CORS blocked).';
+        outagesLayer.clearLayers();
+        items.forEach(it => L.circle([it.lat,it.lon], {radius:200, color:'orange'}).addTo(outagesLayer).bindPopup(it.desc || 'outage'));
+        // Severity approximate
+        const severity = Math.min(50, items.length * 10);
+        return {severity};
+      }catch(e){
+        outagesEl.innerText = 'Outage feed error';
+        return {severity:0};
+      }
+    }
+
+    async function fetchEmergencyAlerts(){
+      try{
+        const url = `https://api.weather.gov/alerts/active?point=${HOME.lat},${HOME.lon}`;
+        const r = await fetch(url).then(res=>res.json());
+        const alerts = r.features || [];
+        if(alerts.length){
+          const list = alerts.map(a=>a.properties && (a.properties.event || a.properties.headline)).filter(Boolean);
+          threatDetailsEl.innerHTML = '<strong>Active Alerts:</strong><br/>' + list.join('<hr/>');
+          return {severity: 40 + Math.min(30, alerts.length * 8), list: alerts};
+        } else {
+          threatDetailsEl.innerHTML = 'No active emergency alerts.';
+          return {severity:0, list:[]};
+        }
+      }catch(e){
+        return {severity:0, list:[]};
+      }
+    }
+
+    async function fetchCrimeData(){
+      try{
+        if(!cfg.crimeFeed){
+          crimeSummaryEl.innerText = 'Crime feed not configured';
+          crimeListEl.innerHTML = '<li>No data</li>';
+          return {severity:0, count:0};
+        }
+        // Try Socrata-like endpoint; user should replace with agency dataset
+        const q = `${cfg.crimeFeed}?$limit=200&$order=occurred_date DESC`;
+        const data = await fetch(q).then(r=>r.json()).catch(()=>[]);
+        const nearby = (data || []).filter(d=>{
+          const lat = d.latitude || (d.location && d.location.latitude) || (d.point && d.point.coordinates && d.point.coordinates[1]);
+          const lon = d.longitude || (d.location && d.location.longitude) || (d.point && d.point.coordinates && d.point.coordinates[0]);
+          if(!lat || !lon) return false;
+          return haversineMiles(HOME.lat, HOME.lon, parseFloat(lat), parseFloat(lon)) <= RADIUS_MILES;
+        });
+        crimeListEl.innerHTML = nearby.slice(0,10).map(n=>{
+          const when = n.occurred_date || n.date || n.datetime || n.reported_date || n.occurred_date_time;
+          const type = n.offense || n.type || n.crime_type || n.incident_type || 'incident';
+          return `<li>${type} — ${when ? new Date(when).toLocaleString() : 'time unknown'}</li>`;
+        }).join('') || '<li>No recent incidents in 1 mile</li>';
+        crimeSummaryEl.innerText = `${nearby.length} incidents in  recent records (filtered to 1 mile) — data source may be incomplete`;
+        incidentsLayer.clearLayers();
+        nearby.slice(0,50).forEach(r=>{
+          const lat = r.latitude || (r.location && r.location.latitude) || (r.point && r.point.coordinates && r.point.coordinates[1]);
+          const lon = r.longitude || (r.location && r.location.longitude) || (r.point && r.point.coordinates && r.point.coordinates[0]);
+          if(lat && lon) L.marker([parseFloat(lat),parseFloat(lon)], {icon: L.icon({iconUrl:'https://cdn-icons-png.flaticon.com/512/194/194932.png', iconSize:[20,20]})}).addTo(incidentsLayer).bindPopup((r.offense || r.type || 'incident') + '<br/>' + (r.occurred_date || r.date || ''));
+        });
+        return {severity: Math.min(50, nearby.length * 10), count: nearby.length};
+      }catch(e){
+        crimeSummaryEl.innerText = 'Crime feed error';
+        crimeListEl.innerHTML = '<li>Error</li>';
+        return {severity:0};
+      }
+    }
+
+    function computeThreatScore(parts){
+      const total = parts.reduce((s,p)=>s + (p.severity || 0), 0);
+      return Math.min(100, Math.round(total));
+    }
+
+    async function refreshAll(){
+      lastUpdatedEl.innerText = 'Updating...';
+      const [weather, traffic, outages, alerts, crime] = await Promise.all([
+        fetchWeather(),
+        fetchTraffic(),
+        fetchOutages(),
+        fetchEmergencyAlerts(),
+        fetchCrimeData()
+      ]);
+      const score = computeThreatScore([weather, traffic, outages, alerts, crime]);
+      scoreEl.innerText = score;
+      const threatDiv = document.getElementById('threat');
+      threatDiv.className = 'widget ' + (score >= 50 ? 'danger' : 'ok');
+      lastUpdatedEl.innerText = 'Last updated: ' + new Date().toLocaleString();
+    }
+
+    // initial
+    refreshAll();
+    document.getElementById('refreshBtn').addEventListener('click', refreshAll);
+    setInterval(()=>{ if(document.getElementById('autoRefresh').checked) refreshAll(); }, AUTO_REFRESH_MS);
+  })();
+  </script>
+</body>
+</html>
